@@ -60,6 +60,67 @@ namespace GharMitra.Infrastructure.Migrations
 
                     b.ToTable("Categories", (string)null);
                 });
+
+            modelBuilder.Entity("GharMitra.Domain.Entities.Income", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<decimal>("Amount")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("decimal(18,2)");
+
+                    b.Property<Guid>("CategoryId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("datetime2")
+                        .HasDefaultValueSql("GETUTCDATE()");
+
+                    b.Property<DateTime>("IncomeDate")
+                        .HasColumnType("datetime2");
+
+                    b.Property<bool>("IsActive")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bit")
+                        .HasDefaultValue(true);
+
+                    b.Property<string>("SourceName")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<DateTime?>("UpdatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CategoryId")
+                        .HasDatabaseName("IX_Income_CategoryId");
+
+                    b.HasIndex("IncomeDate")
+                        .HasDatabaseName("IX_Income_IncomeDate");
+
+                    b.HasIndex("IsActive")
+                        .HasDatabaseName("IX_Income_IsActive");
+
+                    b.HasIndex("IsActive", "IncomeDate")
+                        .HasDatabaseName("IX_Income_IsActive_IncomeDate");
+
+                    b.ToTable("Incomes", (string)null);
+                });
+
+            modelBuilder.Entity("GharMitra.Domain.Entities.Income", b =>
+                {
+                    b.HasOne("GharMitra.Domain.Entities.Category", "Category")
+                        .WithMany()
+                        .HasForeignKey("CategoryId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Category");
+                });
 #pragma warning restore 612, 618
         }
     }
