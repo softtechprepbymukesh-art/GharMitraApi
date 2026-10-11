@@ -37,25 +37,19 @@ public sealed class IncomeConfiguration : IEntityTypeConfiguration<Income>
 
         builder.Property(x => x.UpdatedAt);
 
-        // Foreign Key
+        // Foreign Key relationship
         builder.HasOne(x => x.Category)
             .WithMany()
             .HasForeignKey(x => x.CategoryId)
             .OnDelete(DeleteBehavior.Restrict)
             .IsRequired();
 
-        // Indexes
+        // Essential indexes only
         builder.HasIndex(x => x.CategoryId)
             .HasDatabaseName("IX_Income_CategoryId");
 
         builder.HasIndex(x => x.IsActive)
             .HasDatabaseName("IX_Income_IsActive");
-
-        builder.HasIndex(x => x.IncomeDate)
-            .HasDatabaseName("IX_Income_IncomeDate");
-
-        builder.HasIndex(x => new { x.IsActive, x.IncomeDate })
-            .HasDatabaseName("IX_Income_IsActive_IncomeDate");
 
         builder.ToTable("Incomes");
     }

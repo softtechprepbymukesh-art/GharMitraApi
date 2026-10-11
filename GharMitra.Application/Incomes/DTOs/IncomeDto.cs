@@ -1,6 +1,4 @@
-﻿using GharMitra.Domain.Entities;
-
-namespace GharMitra.Application.Incomes.DTOs;
+﻿namespace GharMitra.Application.Incomes.DTOs;
 
 public sealed record IncomeDto(
     Guid Id,

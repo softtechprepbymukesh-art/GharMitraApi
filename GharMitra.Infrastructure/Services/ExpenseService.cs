@@ -108,6 +108,11 @@ public sealed class ExpenseService : IExpenseService
                 nameof(request.CategoryId));
         }
 
+        await EnsureFamilyAndMemberAsync(
+            request.FamilyId,
+            request.FamilyMemberId,
+            cancellationToken);
+
         var expense = new Expense
         {
             FamilyId = request.FamilyId,
@@ -162,6 +167,11 @@ public sealed class ExpenseService : IExpenseService
                 $"Expense category with ID {request.CategoryId} was not found.",
                 nameof(request.CategoryId));
         }
+
+        await EnsureFamilyAndMemberAsync(
+            request.FamilyId,
+            request.FamilyMemberId,
+            cancellationToken);
 
         var expense = await _context.Expenses
             .FirstOrDefaultAsync(
@@ -218,6 +228,40 @@ public sealed class ExpenseService : IExpenseService
     }
 
     #endregion
+
+    private async Task EnsureFamilyAndMemberAsync(
+        int familyId,
+        int familyMemberId,
+        CancellationToken cancellationToken)
+    {
+        var family = await _context.Families
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == familyId, cancellationToken);
+
+        if (family is null || !family.IsActive)
+        {
+            throw new ArgumentException(
+                $"Active family with ID {familyId} was not found.",
+                nameof(familyId));
+        }
+
+        var member = await _context.FamilyMembers
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == familyMemberId, cancellationToken);
+
+        if (member is null || !member.IsActive)
+        {
+            throw new ArgumentException(
+                $"Active family member with ID {familyMemberId} was not found.",
+                nameof(familyMemberId));
+        }
+
+        if (member.FamilyId != familyId)
+        {
+            throw new ArgumentException(
+                "Family member does not belong to the specified family.");
+        }
+    }
 
     #region Mapping
 

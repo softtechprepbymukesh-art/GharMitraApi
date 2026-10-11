@@ -1,7 +1,7 @@
 ﻿using GharMitra.Domain.Entities;
 
-namespace GharMitra.Application.Categories.DTOs
-{
+namespace GharMitra.Application.Categories.DTOs;
+
 public sealed record CategoryDto(
     Guid Id,
     string Name,
@@ -11,4 +11,3 @@ public sealed record CategoryDto(
     int DisplayOrder,
     DateTime CreatedAt,
     DateTime? UpdatedAt);
-}

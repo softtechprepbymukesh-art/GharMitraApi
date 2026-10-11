@@ -2,7 +2,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
-namespace GharMitra.Infrastructure.Configurations;
+namespace GharMitra.Infrastructure.Data.Configurations;
 
 public class FamilyConfiguration : IEntityTypeConfiguration<Family>
 {

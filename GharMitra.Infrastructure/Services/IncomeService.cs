@@ -33,26 +33,27 @@ public sealed class IncomeService : IIncomeService
         Guid id,
         CancellationToken cancellationToken = default)
     {
-        return await _context.Incomes
+        var income = await _context.Incomes
             .AsNoTracking()
             .Include(x => x.Category)
-            .Where(x => x.Id == id)
-            .Select(x => MapToDto(x))
-            .FirstOrDefaultAsync(cancellationToken);
+            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+
+        return income is null ? null : MapToDto(income);
     }
 
     public async Task<IReadOnlyList<IncomeDto>> GetByCategoryIdAsync(
         Guid categoryId,
         CancellationToken cancellationToken = default)
     {
-        return await _context.Incomes
+        var incomes = await _context.Incomes
             .AsNoTracking()
             .Include(x => x.Category)
             .Where(x => x.CategoryId == categoryId && x.IsActive)
             .OrderByDescending(x => x.IncomeDate)
             .ThenByDescending(x => x.CreatedAt)
-            .Select(x => MapToDto(x))
             .ToListAsync(cancellationToken);
+
+        return incomes.Select(MapToDto).ToList();
     }
 
     public async Task<IncomeDto> CreateAsync(
@@ -61,12 +62,7 @@ public sealed class IncomeService : IIncomeService
     {
         ValidateCreateRequest(request);
 
-        // Verify category exists
-        var categoryExists = await _context.Categories
-            .AnyAsync(x => x.Id == request.CategoryId, cancellationToken);
-
-        if (!categoryExists)
-            throw new ArgumentException($"Category with ID {request.CategoryId} not found.", nameof(request.CategoryId));
+        await EnsureIncomeCategoryAsync(request.CategoryId, cancellationToken);
 
         var income = new Income(
             request.SourceName,
@@ -90,11 +86,7 @@ public sealed class IncomeService : IIncomeService
     {
         ValidateUpdateRequest(request);
 
-        var categoryExists = await _context.Categories
-            .AnyAsync(x => x.Id == request.CategoryId, cancellationToken);
-
-        if (!categoryExists)
-            throw new ArgumentException($"Category with ID {request.CategoryId} not found.", nameof(request.CategoryId));
+        await EnsureIncomeCategoryAsync(request.CategoryId, cancellationToken);
 
         var income = await _context.Incomes
             .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
@@ -162,6 +154,26 @@ public sealed class IncomeService : IIncomeService
         await _context.SaveChangesAsync(cancellationToken);
 
         return true;
+    }
+
+    private async Task EnsureIncomeCategoryAsync(
+        Guid categoryId,
+        CancellationToken cancellationToken)
+    {
+        var category = await _context.Categories
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                x => x.Id == categoryId &&
+                     x.Type == CategoryType.Income &&
+                     x.IsActive,
+                cancellationToken);
+
+        if (category is null)
+        {
+            throw new ArgumentException(
+                $"Income category with ID {categoryId} was not found.",
+                nameof(categoryId));
+        }
     }
 
     private static IncomeDto MapToDto(Income income)
