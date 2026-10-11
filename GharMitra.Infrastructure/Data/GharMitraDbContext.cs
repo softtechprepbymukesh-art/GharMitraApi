@@ -13,9 +13,10 @@ public class GharMitraDbContext : DbContext
 
     public DbSet<Category> Categories => Set<Category>();
     public DbSet<Income> Incomes => Set<Income>();
+    public DbSet<Expense> Expenses { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
+    {   
         base.OnModelCreating(modelBuilder);
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(GharMitraDbContext).Assembly);
     }
