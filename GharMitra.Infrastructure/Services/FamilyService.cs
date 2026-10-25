@@ -1,30 +1,62 @@
+using System.Data;
 using GharMitra.Application.Families.DTOs;
 using GharMitra.Application.Families.Interfaces;
-using GharMitra.Domain.Entities;
 using GharMitra.Infrastructure.Data;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.SqlClient;
 
 namespace GharMitra.Infrastructure.Services;
 
 public sealed class FamilyService : IFamilyService
 {
-    private readonly GharMitraDbContext _context;
+    private const string FamilySelectSql =
+        "SELECT Id, Name, IsActive, CreatedAt FROM Families";
 
-    public FamilyService(GharMitraDbContext context)
+    private const string MemberSelectSql =
+        "SELECT Id, FamilyId, Name, Role, IsFamilyHead, IsActive, CreatedAt FROM FamilyMembers";
+
+    private const string MemberOrderBySql = "ORDER BY IsFamilyHead DESC, Name";
+
+    private readonly ISqlConnectionFactory _connectionFactory;
+
+    public FamilyService(ISqlConnectionFactory connectionFactory)
     {
-        _context = context ?? throw new ArgumentNullException(nameof(context));
+        _connectionFactory = connectionFactory
+            ?? throw new ArgumentNullException(nameof(connectionFactory));
     }
 
     public async Task<IReadOnlyList<FamilyDto>> GetAllAsync(
         CancellationToken cancellationToken = default)
     {
-        var families = await _context.Families
-            .AsNoTracking()
-            .Include(x => x.Members)
-            .OrderBy(x => x.Name)
-            .ToListAsync(cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        return families.Select(MapToDto).ToList();
+        var families = new List<(int Id, string Name, bool IsActive, DateTime CreatedAt)>();
+        await using (var command = connection.CreateCommand($"{FamilySelectSql} ORDER BY Name"))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                families.Add((
+                    reader.GetInt32(0),
+                    reader.GetString(1),
+                    reader.GetBoolean(2),
+                    reader.GetDateTime(3)));
+            }
+        }
+
+        IReadOnlyList<FamilyMemberDto> members;
+        await using (var command = connection.CreateCommand($"{MemberSelectSql} {MemberOrderBySql}"))
+        {
+            members = await ReadMembersAsync(command, cancellationToken);
+        }
+
+        return families
+            .Select(f => new FamilyDto(
+                f.Id,
+                f.Name,
+                f.IsActive,
+                f.CreatedAt,
+                members.Where(m => m.FamilyId == f.Id).ToList()))
+            .ToList();
     }
 
     public async Task<FamilyDto?> GetByIdAsync(
@@ -34,12 +66,9 @@ public sealed class FamilyService : IFamilyService
         if (id <= 0)
             return null;
 
-        var family = await _context.Families
-            .AsNoTracking()
-            .Include(x => x.Members)
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        return family is null ? null : MapToDto(family);
+        return await GetByIdAsync(connection, id, cancellationToken);
     }
 
     public async Task<FamilyDto> CreateAsync(
@@ -47,18 +76,21 @@ public sealed class FamilyService : IFamilyService
         CancellationToken cancellationToken = default)
     {
         var name = ValidateName(request.Name);
+        var createdAt = DateTime.UtcNow;
 
-        var family = new Family
-        {
-            Name = name,
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow
-        };
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand(
+            """
+            INSERT INTO Families (Name, IsActive, CreatedAt)
+            OUTPUT INSERTED.Id
+            VALUES (@Name, 1, @CreatedAt)
+            """)
+            .With("@Name", SqlDbType.NVarChar, name, 150)
+            .With("@CreatedAt", SqlDbType.DateTime2, createdAt);
 
-        _context.Families.Add(family);
-        await _context.SaveChangesAsync(cancellationToken);
+        var id = (int)(await command.ExecuteScalarAsync(cancellationToken))!;
 
-        return MapToDto(family);
+        return new FamilyDto(id, name, true, createdAt, new List<FamilyMemberDto>());
     }
 
     public async Task<bool> UpdateAsync(
@@ -69,16 +101,20 @@ public sealed class FamilyService : IFamilyService
         if (id <= 0)
             return false;
 
-        var family = await _context.Families
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (family is null)
+        if (!await FamilyExistsAsync(connection, id, cancellationToken))
             return false;
 
-        family.Name = ValidateName(request.Name);
-        family.IsActive = request.IsActive;
+        var name = ValidateName(request.Name);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        await using var command = connection.CreateCommand(
+            "UPDATE Families SET Name = @Name, IsActive = @IsActive WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, id)
+            .With("@Name", SqlDbType.NVarChar, name, 150)
+            .With("@IsActive", SqlDbType.Bit, request.IsActive);
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
         return true;
     }
 
@@ -89,20 +125,28 @@ public sealed class FamilyService : IFamilyService
         if (id <= 0)
             return false;
 
-        var family = await _context.Families
-            .Include(x => x.Members)
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
-        if (family is null)
-            return false;
-
-        family.IsActive = false;
-        foreach (var member in family.Members)
+        int affected;
+        await using (var command = connection.CreateCommand(
+            "UPDATE Families SET IsActive = 0 WHERE Id = @Id", transaction)
+            .With("@Id", SqlDbType.Int, id))
         {
-            member.IsActive = false;
+            affected = await command.ExecuteNonQueryAsync(cancellationToken);
         }
 
-        await _context.SaveChangesAsync(cancellationToken);
+        if (affected == 0)
+            return false;
+
+        await using (var command = connection.CreateCommand(
+            "UPDATE FamilyMembers SET IsActive = 0 WHERE FamilyId = @Id", transaction)
+            .With("@Id", SqlDbType.Int, id))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
         return true;
     }
 
@@ -113,14 +157,12 @@ public sealed class FamilyService : IFamilyService
         if (familyId <= 0)
             return Array.Empty<FamilyMemberDto>();
 
-        var members = await _context.FamilyMembers
-            .AsNoTracking()
-            .Where(x => x.FamilyId == familyId)
-            .OrderByDescending(x => x.IsFamilyHead)
-            .ThenBy(x => x.Name)
-            .ToListAsync(cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection
+            .CreateCommand($"{MemberSelectSql} WHERE FamilyId = @FamilyId {MemberOrderBySql}")
+            .With("@FamilyId", SqlDbType.Int, familyId);
 
-        return members.Select(MapToMemberDto).ToList();
+        return await ReadMembersAsync(command, cancellationToken);
     }
 
     public async Task<FamilyMemberDto> AddMemberAsync(
@@ -128,27 +170,47 @@ public sealed class FamilyService : IFamilyService
         CreateFamilyMemberRequest request,
         CancellationToken cancellationToken = default)
     {
-        var family = await GetActiveFamilyAsync(familyId, cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        var member = new FamilyMember
-        {
-            FamilyId = family.Id,
-            Name = ValidateName(request.Name),
-            Role = ValidateRole(request.Role),
-            IsFamilyHead = request.IsFamilyHead,
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow
-        };
+        await EnsureActiveFamilyAsync(connection, familyId, cancellationToken);
 
-        if (member.IsFamilyHead)
+        var name = ValidateName(request.Name);
+        var role = ValidateRole(request.Role);
+        var createdAt = DateTime.UtcNow;
+
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        if (request.IsFamilyHead)
         {
-            await ClearFamilyHeadAsync(family.Id, excludeMemberId: null, cancellationToken);
+            await ClearFamilyHeadAsync(connection, transaction, familyId, null, cancellationToken);
         }
 
-        _context.FamilyMembers.Add(member);
-        await _context.SaveChangesAsync(cancellationToken);
+        int id;
+        await using (var command = connection.CreateCommand(
+            """
+            INSERT INTO FamilyMembers (FamilyId, Name, Role, IsFamilyHead, IsActive, CreatedAt)
+            OUTPUT INSERTED.Id
+            VALUES (@FamilyId, @Name, @Role, @IsFamilyHead, 1, @CreatedAt)
+            """, transaction)
+            .With("@FamilyId", SqlDbType.Int, familyId)
+            .With("@Name", SqlDbType.NVarChar, name, 150)
+            .With("@Role", SqlDbType.NVarChar, role, 50)
+            .With("@IsFamilyHead", SqlDbType.Bit, request.IsFamilyHead)
+            .With("@CreatedAt", SqlDbType.DateTime2, createdAt))
+        {
+            id = (int)(await command.ExecuteScalarAsync(cancellationToken))!;
+        }
 
-        return MapToMemberDto(member);
+        await transaction.CommitAsync(cancellationToken);
+
+        return new FamilyMemberDto(
+            id,
+            familyId,
+            name,
+            role,
+            request.IsFamilyHead,
+            true,
+            createdAt);
     }
 
     public async Task<bool> UpdateMemberAsync(
@@ -160,26 +222,47 @@ public sealed class FamilyService : IFamilyService
         if (familyId <= 0 || memberId <= 0)
             return false;
 
-        var member = await _context.FamilyMembers
-            .FirstOrDefaultAsync(
-                x => x.Id == memberId && x.FamilyId == familyId,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (member is null)
-            return false;
-
-        member.Name = ValidateName(request.Name);
-        member.Role = ValidateRole(request.Role);
-        member.IsActive = request.IsActive;
-
-        if (request.IsFamilyHead && !member.IsFamilyHead)
+        bool? currentIsHead;
+        await using (var command = connection
+            .CreateCommand("SELECT IsFamilyHead FROM FamilyMembers WHERE Id = @Id AND FamilyId = @FamilyId")
+            .With("@Id", SqlDbType.Int, memberId)
+            .With("@FamilyId", SqlDbType.Int, familyId))
         {
-            await ClearFamilyHeadAsync(familyId, member.Id, cancellationToken);
+            currentIsHead = await command.ExecuteScalarAsync(cancellationToken) as bool?;
         }
 
-        member.IsFamilyHead = request.IsFamilyHead;
+        if (currentIsHead is null)
+            return false;
 
-        await _context.SaveChangesAsync(cancellationToken);
+        var name = ValidateName(request.Name);
+        var role = ValidateRole(request.Role);
+
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        if (request.IsFamilyHead && currentIsHead != true)
+        {
+            await ClearFamilyHeadAsync(connection, transaction, familyId, memberId, cancellationToken);
+        }
+
+        await using (var command = connection.CreateCommand(
+            """
+            UPDATE FamilyMembers
+            SET Name = @Name, Role = @Role, IsActive = @IsActive, IsFamilyHead = @IsFamilyHead
+            WHERE Id = @Id AND FamilyId = @FamilyId
+            """, transaction)
+            .With("@Id", SqlDbType.Int, memberId)
+            .With("@FamilyId", SqlDbType.Int, familyId)
+            .With("@Name", SqlDbType.NVarChar, name, 150)
+            .With("@Role", SqlDbType.NVarChar, role, 50)
+            .With("@IsActive", SqlDbType.Bit, request.IsActive)
+            .With("@IsFamilyHead", SqlDbType.Bit, request.IsFamilyHead))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
         return true;
     }
 
@@ -191,82 +274,121 @@ public sealed class FamilyService : IFamilyService
         if (familyId <= 0 || memberId <= 0)
             return false;
 
-        var member = await _context.FamilyMembers
-            .FirstOrDefaultAsync(
-                x => x.Id == memberId && x.FamilyId == familyId,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand(
+            "UPDATE FamilyMembers SET IsActive = 0, IsFamilyHead = 0 WHERE Id = @Id AND FamilyId = @FamilyId")
+            .With("@Id", SqlDbType.Int, memberId)
+            .With("@FamilyId", SqlDbType.Int, familyId);
 
-        if (member is null)
-            return false;
-
-        member.IsActive = false;
-        member.IsFamilyHead = false;
-
-        await _context.SaveChangesAsync(cancellationToken);
-        return true;
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
-    private async Task<Family> GetActiveFamilyAsync(
+    private static async Task<FamilyDto?> GetByIdAsync(
+        SqlConnection connection,
+        int id,
+        CancellationToken cancellationToken)
+    {
+        FamilyDto? family = null;
+        await using (var command = connection
+            .CreateCommand($"{FamilySelectSql} WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, id))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                family = new FamilyDto(
+                    reader.GetInt32(0),
+                    reader.GetString(1),
+                    reader.GetBoolean(2),
+                    reader.GetDateTime(3),
+                    new List<FamilyMemberDto>());
+            }
+        }
+
+        if (family is null)
+            return null;
+
+        await using var membersCommand = connection
+            .CreateCommand($"{MemberSelectSql} WHERE FamilyId = @FamilyId {MemberOrderBySql}")
+            .With("@FamilyId", SqlDbType.Int, id);
+
+        return family with { Members = await ReadMembersAsync(membersCommand, cancellationToken) };
+    }
+
+    private static async Task<bool> FamilyExistsAsync(
+        SqlConnection connection,
+        int id,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection
+            .CreateCommand("SELECT 1 FROM Families WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, id);
+
+        return await command.ExecuteScalarAsync(cancellationToken) is not null;
+    }
+
+    private static async Task EnsureActiveFamilyAsync(
+        SqlConnection connection,
         int familyId,
         CancellationToken cancellationToken)
     {
         if (familyId <= 0)
             throw new ArgumentException("Family ID is required.");
 
-        var family = await _context.Families
-            .FirstOrDefaultAsync(x => x.Id == familyId, cancellationToken);
+        await using var command = connection
+            .CreateCommand("SELECT IsActive FROM Families WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, familyId);
 
-        if (family is null)
+        var isActive = await command.ExecuteScalarAsync(cancellationToken) as bool?;
+
+        if (isActive is null)
             throw new ArgumentException($"Family with ID {familyId} was not found.");
 
-        if (!family.IsActive)
+        if (isActive == false)
             throw new ArgumentException($"Family with ID {familyId} is inactive.");
-
-        return family;
     }
 
-    private async Task ClearFamilyHeadAsync(
+    private static async Task ClearFamilyHeadAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
         int familyId,
         int? excludeMemberId,
         CancellationToken cancellationToken)
     {
-        var heads = await _context.FamilyMembers
-            .Where(x =>
-                x.FamilyId == familyId &&
-                x.IsFamilyHead &&
-                (excludeMemberId == null || x.Id != excludeMemberId))
-            .ToListAsync(cancellationToken);
+        await using var command = connection.CreateCommand(
+            """
+            UPDATE FamilyMembers
+            SET IsFamilyHead = 0
+            WHERE FamilyId = @FamilyId
+              AND IsFamilyHead = 1
+              AND (@ExcludeId IS NULL OR Id <> @ExcludeId)
+            """, transaction)
+            .With("@FamilyId", SqlDbType.Int, familyId)
+            .With("@ExcludeId", SqlDbType.Int, excludeMemberId);
 
-        foreach (var head in heads)
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<FamilyMemberDto>> ReadMembersAsync(
+        SqlCommand command,
+        CancellationToken cancellationToken)
+    {
+        var members = new List<FamilyMemberDto>();
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
-            head.IsFamilyHead = false;
+            members.Add(new FamilyMemberDto(
+                reader.GetInt32(0),
+                reader.GetInt32(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetBoolean(4),
+                reader.GetBoolean(5),
+                reader.GetDateTime(6)));
         }
-    }
 
-    private static FamilyDto MapToDto(Family family)
-    {
-        return new FamilyDto(
-            family.Id,
-            family.Name,
-            family.IsActive,
-            family.CreatedAt,
-            family.Members
-                .OrderByDescending(x => x.IsFamilyHead)
-                .ThenBy(x => x.Name)
-                .Select(MapToMemberDto)
-                .ToList());
-    }
-
-    private static FamilyMemberDto MapToMemberDto(FamilyMember member)
-    {
-        return new FamilyMemberDto(
-            member.Id,
-            member.FamilyId,
-            member.Name,
-            member.Role,
-            member.IsFamilyHead,
-            member.IsActive,
-            member.CreatedAt);
+        return members;
     }
 
     private static string ValidateName(string name)

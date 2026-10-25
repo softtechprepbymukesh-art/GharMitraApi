@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="../GharMitra.Application/GharMitra.Application.csproj" Id="afd86d46-dd55-489b-840f-282eda038856" />
+  <Project Path="../GharMitra.Domain/GharMitra.Domain.csproj" Id="6e5fcd3b-52b2-4054-984a-7c57abab2411" />
+  <Project Path="../GharMitra.Infrastructure/GharMitra.Infrastructure.csproj" Id="0ad4a8e8-8786-40ce-afa3-5bb01e63a5e7" />
+  <Project Path="../GharMitra.Shared/GharMitra.Shared.csproj" Id="b3b068a2-f2f5-407d-bc63-7e3b384a8085" />
+  <Project Path="../GharMitra.Tests/GharMitra.Tests.csproj" />
+  <Project Path="GharMitra.Api.csproj" />
+</Solution>

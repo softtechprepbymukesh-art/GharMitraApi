@@ -1,18 +1,31 @@
-﻿using GharMitra.Application.Expenses.DTOs;
+using System.Data;
+using GharMitra.Application.Expenses.DTOs;
 using GharMitra.Application.Expenses.Interfaces;
 using GharMitra.Domain.Entities;
 using GharMitra.Infrastructure.Data;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.SqlClient;
 
 namespace GharMitra.Infrastructure.Services;
 
 public sealed class ExpenseService : IExpenseService
 {
-    private readonly GharMitraDbContext _context;
+    private const string SelectSql =
+        """
+        SELECT e.Id, e.FamilyId, e.FamilyMemberId, e.CategoryId, e.Amount, e.ExpenseDate,
+               e.ExpenseType, e.PaymentMethod, e.SpendingType, e.IsEssential, e.IsRecurring,
+               e.Notes, e.CreatedAt, e.UpdatedAt, c.Name
+        FROM Expenses e
+        INNER JOIN Categories c ON c.Id = e.CategoryId
+        """;
 
-    public ExpenseService(GharMitraDbContext context)
+    private const string OrderBySql = "ORDER BY e.ExpenseDate DESC, e.CreatedAt DESC";
+
+    private readonly ISqlConnectionFactory _connectionFactory;
+
+    public ExpenseService(ISqlConnectionFactory connectionFactory)
     {
-        _context = context ?? throw new ArgumentNullException(nameof(context));
+        _connectionFactory = connectionFactory
+            ?? throw new ArgumentNullException(nameof(connectionFactory));
     }
 
     #region Read Operations
@@ -20,16 +33,10 @@ public sealed class ExpenseService : IExpenseService
     public async Task<IReadOnlyList<ExpenseDto>> GetAllAsync(
         CancellationToken cancellationToken = default)
     {
-        var expenses = await _context.Expenses
-            .AsNoTracking()
-            .Include(x => x.Category)
-            .OrderByDescending(x => x.ExpenseDate)
-            .ThenByDescending(x => x.CreatedAt)
-            .ToListAsync(cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand($"{SelectSql} {OrderBySql}");
 
-        return expenses
-            .Select(MapToDto)
-            .ToList();
+        return await ReadAllAsync(command, cancellationToken);
     }
 
     public async Task<ExpenseDto?> GetByIdAsync(
@@ -39,16 +46,9 @@ public sealed class ExpenseService : IExpenseService
         if (id <= 0)
             return null;
 
-        var expense = await _context.Expenses
-            .AsNoTracking()
-            .Include(x => x.Category)
-            .FirstOrDefaultAsync(
-                x => x.Id == id,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        return expense is null
-            ? null
-            : MapToDto(expense);
+        return await GetByIdAsync(connection, id, cancellationToken);
     }
 
     public async Task<IReadOnlyList<ExpenseDto>> GetByCategoryIdAsync(
@@ -58,17 +58,12 @@ public sealed class ExpenseService : IExpenseService
         if (categoryId == Guid.Empty)
             return Array.Empty<ExpenseDto>();
 
-        var expenses = await _context.Expenses
-            .AsNoTracking()
-            .Include(x => x.Category)
-            .Where(x => x.CategoryId == categoryId)
-            .OrderByDescending(x => x.ExpenseDate)
-            .ThenByDescending(x => x.CreatedAt)
-            .ToListAsync(cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection
+            .CreateCommand($"{SelectSql} WHERE e.CategoryId = @CategoryId {OrderBySql}")
+            .With("@CategoryId", SqlDbType.UniqueIdentifier, categoryId);
 
-        return expenses
-            .Select(MapToDto)
-            .ToList();
+        return await ReadAllAsync(command, cancellationToken);
     }
 
     public async Task<decimal> GetTotalExpensesByCategoryAsync(
@@ -78,10 +73,13 @@ public sealed class ExpenseService : IExpenseService
         if (categoryId == Guid.Empty)
             return 0m;
 
-        return await _context.Expenses
-            .AsNoTracking()
-            .Where(x => x.CategoryId == categoryId)
-            .SumAsync(x => x.Amount, cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection
+            .CreateCommand("SELECT COALESCE(SUM(Amount), 0) FROM Expenses WHERE CategoryId = @CategoryId")
+            .With("@CategoryId", SqlDbType.UniqueIdentifier, categoryId);
+
+        var total = await command.ExecuteScalarAsync(cancellationToken);
+        return total is decimal value ? value : 0m;
     }
 
     #endregion
@@ -94,50 +92,42 @@ public sealed class ExpenseService : IExpenseService
     {
         ValidateCreateRequest(request);
 
-        var category = await _context.Categories
-            .FirstOrDefaultAsync(
-                x => x.Id == request.CategoryId &&
-                     x.Type == CategoryType.Expense &&
-                     x.IsActive,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (category is null)
-        {
-            throw new ArgumentException(
-                $"Expense category with ID {request.CategoryId} was not found.",
-                nameof(request.CategoryId));
-        }
+        await EnsureExpenseCategoryAsync(connection, request.CategoryId, cancellationToken);
 
         await EnsureFamilyAndMemberAsync(
+            connection,
             request.FamilyId,
             request.FamilyMemberId,
             cancellationToken);
 
-        var expense = new Expense
-        {
-            FamilyId = request.FamilyId,
-            FamilyMemberId = request.FamilyMemberId,
-            CategoryId = request.CategoryId,
-            Amount = request.Amount,
-            ExpenseDate = request.ExpenseDate,
-            ExpenseType = request.ExpenseType.Trim(),
-            PaymentMethod = request.PaymentMethod.Trim(),
-            SpendingType = request.SpendingType.Trim(),
-            IsEssential = request.IsEssential,
-            IsRecurring = request.IsRecurring,
-            Notes = string.IsNullOrWhiteSpace(request.Notes)
-                ? null
-                : request.Notes.Trim(),
-            CreatedAt = DateTime.UtcNow
-        };
+        await using var command = connection.CreateCommand(
+            """
+            INSERT INTO Expenses
+                (FamilyId, FamilyMemberId, CategoryId, Amount, ExpenseDate, ExpenseType,
+                 PaymentMethod, SpendingType, IsEssential, IsRecurring, Notes, CreatedAt, UpdatedAt)
+            OUTPUT INSERTED.Id
+            VALUES
+                (@FamilyId, @FamilyMemberId, @CategoryId, @Amount, @ExpenseDate, @ExpenseType,
+                 @PaymentMethod, @SpendingType, @IsEssential, @IsRecurring, @Notes, @CreatedAt, NULL)
+            """)
+            .With("@FamilyId", SqlDbType.Int, request.FamilyId)
+            .With("@FamilyMemberId", SqlDbType.Int, request.FamilyMemberId)
+            .With("@CategoryId", SqlDbType.UniqueIdentifier, request.CategoryId)
+            .With("@Amount", SqlDbType.Decimal, request.Amount)
+            .With("@ExpenseDate", SqlDbType.DateTime2, request.ExpenseDate)
+            .With("@ExpenseType", SqlDbType.NVarChar, request.ExpenseType.Trim(), 50)
+            .With("@PaymentMethod", SqlDbType.NVarChar, request.PaymentMethod.Trim(), 50)
+            .With("@SpendingType", SqlDbType.NVarChar, request.SpendingType.Trim(), 50)
+            .With("@IsEssential", SqlDbType.Bit, request.IsEssential)
+            .With("@IsRecurring", SqlDbType.Bit, request.IsRecurring)
+            .With("@Notes", SqlDbType.NVarChar, CleanNotes(request.Notes), 500)
+            .With("@CreatedAt", SqlDbType.DateTime2, DateTime.UtcNow);
 
-        _context.Expenses.Add(expense);
+        var newId = (int)(await command.ExecuteScalarAsync(cancellationToken))!;
 
-        await _context.SaveChangesAsync(cancellationToken);
-
-        expense.Category = category;
-
-        return MapToDto(expense);
+        return (await GetByIdAsync(connection, newId, cancellationToken))!;
     }
 
     #endregion
@@ -154,51 +144,48 @@ public sealed class ExpenseService : IExpenseService
         if (id <= 0)
             return false;
 
-        var category = await _context.Categories
-            .FirstOrDefaultAsync(
-                x => x.Id == request.CategoryId &&
-                     x.Type == CategoryType.Expense &&
-                     x.IsActive,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (category is null)
-        {
-            throw new ArgumentException(
-                $"Expense category with ID {request.CategoryId} was not found.",
-                nameof(request.CategoryId));
-        }
+        await EnsureExpenseCategoryAsync(connection, request.CategoryId, cancellationToken);
 
         await EnsureFamilyAndMemberAsync(
+            connection,
             request.FamilyId,
             request.FamilyMemberId,
             cancellationToken);
 
-        var expense = await _context.Expenses
-            .FirstOrDefaultAsync(
-                x => x.Id == id,
-                cancellationToken);
+        await using var command = connection.CreateCommand(
+            """
+            UPDATE Expenses
+            SET FamilyId = @FamilyId,
+                FamilyMemberId = @FamilyMemberId,
+                CategoryId = @CategoryId,
+                Amount = @Amount,
+                ExpenseDate = @ExpenseDate,
+                ExpenseType = @ExpenseType,
+                PaymentMethod = @PaymentMethod,
+                SpendingType = @SpendingType,
+                IsEssential = @IsEssential,
+                IsRecurring = @IsRecurring,
+                Notes = @Notes,
+                UpdatedAt = @UpdatedAt
+            WHERE Id = @Id
+            """)
+            .With("@Id", SqlDbType.Int, id)
+            .With("@FamilyId", SqlDbType.Int, request.FamilyId)
+            .With("@FamilyMemberId", SqlDbType.Int, request.FamilyMemberId)
+            .With("@CategoryId", SqlDbType.UniqueIdentifier, request.CategoryId)
+            .With("@Amount", SqlDbType.Decimal, request.Amount)
+            .With("@ExpenseDate", SqlDbType.DateTime2, request.ExpenseDate)
+            .With("@ExpenseType", SqlDbType.NVarChar, request.ExpenseType.Trim(), 50)
+            .With("@PaymentMethod", SqlDbType.NVarChar, request.PaymentMethod.Trim(), 50)
+            .With("@SpendingType", SqlDbType.NVarChar, request.SpendingType.Trim(), 50)
+            .With("@IsEssential", SqlDbType.Bit, request.IsEssential)
+            .With("@IsRecurring", SqlDbType.Bit, request.IsRecurring)
+            .With("@Notes", SqlDbType.NVarChar, CleanNotes(request.Notes), 500)
+            .With("@UpdatedAt", SqlDbType.DateTime2, DateTime.UtcNow);
 
-        if (expense is null)
-            return false;
-
-        expense.FamilyId = request.FamilyId;
-        expense.FamilyMemberId = request.FamilyMemberId;
-        expense.CategoryId = request.CategoryId;
-        expense.Amount = request.Amount;
-        expense.ExpenseDate = request.ExpenseDate;
-        expense.ExpenseType = request.ExpenseType.Trim();
-        expense.PaymentMethod = request.PaymentMethod.Trim();
-        expense.SpendingType = request.SpendingType.Trim();
-        expense.IsEssential = request.IsEssential;
-        expense.IsRecurring = request.IsRecurring;
-        expense.Notes = string.IsNullOrWhiteSpace(request.Notes)
-            ? null
-            : request.Notes.Trim();
-        expense.UpdatedAt = DateTime.UtcNow;
-
-        await _context.SaveChangesAsync(cancellationToken);
-
-        return true;
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
     #endregion
@@ -212,51 +199,92 @@ public sealed class ExpenseService : IExpenseService
         if (id <= 0)
             return false;
 
-        var expense = await _context.Expenses
-            .FirstOrDefaultAsync(
-                x => x.Id == id,
-                cancellationToken);
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = connection
+            .CreateCommand("DELETE FROM Expenses WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, id);
 
-        if (expense is null)
-            return false;
-
-        _context.Expenses.Remove(expense);
-
-        await _context.SaveChangesAsync(cancellationToken);
-
-        return true;
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
     #endregion
 
-    private async Task EnsureFamilyAndMemberAsync(
+    private static async Task<ExpenseDto?> GetByIdAsync(
+        SqlConnection connection,
+        int id,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection
+            .CreateCommand($"{SelectSql} WHERE e.Id = @Id")
+            .With("@Id", SqlDbType.Int, id);
+
+        var items = await ReadAllAsync(command, cancellationToken);
+        return items.Count == 0 ? null : items[0];
+    }
+
+    private static async Task EnsureExpenseCategoryAsync(
+        SqlConnection connection,
+        Guid categoryId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand(
+            "SELECT 1 FROM Categories WHERE Id = @Id AND Type = @Type AND IsActive = 1")
+            .With("@Id", SqlDbType.UniqueIdentifier, categoryId)
+            .With("@Type", SqlDbType.Int, (int)CategoryType.Expense);
+
+        if (await command.ExecuteScalarAsync(cancellationToken) is null)
+        {
+            throw new ArgumentException(
+                $"Expense category with ID {categoryId} was not found.",
+                nameof(categoryId));
+        }
+    }
+
+    private static async Task EnsureFamilyAndMemberAsync(
+        SqlConnection connection,
         int familyId,
         int familyMemberId,
         CancellationToken cancellationToken)
     {
-        var family = await _context.Families
-            .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Id == familyId, cancellationToken);
+        bool? familyActive;
+        await using (var command = connection
+            .CreateCommand("SELECT IsActive FROM Families WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, familyId))
+        {
+            familyActive = await command.ExecuteScalarAsync(cancellationToken) as bool?;
+        }
 
-        if (family is null || !family.IsActive)
+        if (familyActive != true)
         {
             throw new ArgumentException(
                 $"Active family with ID {familyId} was not found.",
                 nameof(familyId));
         }
 
-        var member = await _context.FamilyMembers
-            .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Id == familyMemberId, cancellationToken);
+        int memberFamilyId = 0;
+        bool memberActive = false;
+        bool memberFound = false;
+        await using (var command = connection
+            .CreateCommand("SELECT FamilyId, IsActive FROM FamilyMembers WHERE Id = @Id")
+            .With("@Id", SqlDbType.Int, familyMemberId))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                memberFound = true;
+                memberFamilyId = reader.GetInt32(0);
+                memberActive = reader.GetBoolean(1);
+            }
+        }
 
-        if (member is null || !member.IsActive)
+        if (!memberFound || !memberActive)
         {
             throw new ArgumentException(
                 $"Active family member with ID {familyMemberId} was not found.",
                 nameof(familyMemberId));
         }
 
-        if (member.FamilyId != familyId)
+        if (memberFamilyId != familyId)
         {
             throw new ArgumentException(
                 "Family member does not belong to the specified family.");
@@ -265,25 +293,38 @@ public sealed class ExpenseService : IExpenseService
 
     #region Mapping
 
-    private static ExpenseDto MapToDto(Expense expense)
+    private static async Task<IReadOnlyList<ExpenseDto>> ReadAllAsync(
+        SqlCommand command,
+        CancellationToken cancellationToken)
     {
-        return new ExpenseDto(
-            expense.Id,
-            expense.FamilyId,
-            expense.FamilyMemberId,
-            expense.CategoryId,
-            expense.Amount,
-            expense.ExpenseDate,
-            expense.ExpenseType,
-            expense.PaymentMethod,
-            expense.SpendingType,
-            expense.IsEssential,
-            expense.IsRecurring,
-            expense.Notes,
-            expense.CreatedAt,
-            expense.UpdatedAt,
-            expense.Category?.Name);
+        var items = new List<ExpenseDto>();
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(new ExpenseDto(
+                reader.GetInt32(0),
+                reader.GetInt32(1),
+                reader.GetInt32(2),
+                reader.GetGuid(3),
+                reader.GetDecimal(4),
+                reader.GetDateTime(5),
+                reader.GetString(6),
+                reader.GetString(7),
+                reader.GetString(8),
+                reader.GetBoolean(9),
+                reader.GetBoolean(10),
+                reader.GetNullableString(11),
+                reader.GetDateTime(12),
+                reader.GetNullableDateTime(13),
+                reader.GetNullableString(14)));
+        }
+
+        return items;
     }
+
+    private static string? CleanNotes(string? notes)
+        => string.IsNullOrWhiteSpace(notes) ? null : notes.Trim();
 
     #endregion
 

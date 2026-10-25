@@ -1,0 +1,40 @@
+@GharMitra.Api_HostAddress = http://localhost:5012
+
+### Health
+GET {{GharMitra.Api_HostAddress}}/health
+Accept: application/json
+
+### Families
+GET {{GharMitra.Api_HostAddress}}/api/v1/family
+Accept: application/json
+
+###
+POST {{GharMitra.Api_HostAddress}}/api/v1/family
+Content-Type: application/json
+
+{
+  "name": "Sharma Family"
+}
+
+### Categories
+GET {{GharMitra.Api_HostAddress}}/api/v1/category
+Accept: application/json
+
+###
+POST {{GharMitra.Api_HostAddress}}/api/v1/category
+Content-Type: application/json
+
+{
+  "name": "Groceries",
+  "type": 1,
+  "description": "Food and household",
+  "displayOrder": 1
+}
+
+### Income
+GET {{GharMitra.Api_HostAddress}}/api/v1/income
+Accept: application/json
+
+### Expenses
+GET {{GharMitra.Api_HostAddress}}/api/v1/expense
+Accept: application/json
