@@ -1,43 +1,36 @@
 using GharMitra.Application.Expenses.DTOs;
+using GharMitra.Domain.Entities;
 using GharMitra.Infrastructure.Services;
 
 namespace GharMitra.Tests.Services;
 
 public class ExpenseServiceValidationTests
 {
-    private readonly ExpenseService _service = new(new ThrowingConnectionFactory());
+    private readonly ExpenseService _service = new(new ThrowingConnectionFactory(), FakeCurrentUser.Head());
 
     private static CreateExpenseRequest ValidCreate() => new()
     {
-        FamilyId = 1,
-        FamilyMemberId = 1,
         CategoryId = Guid.NewGuid(),
         Amount = 100m,
         ExpenseDate = DateTime.UtcNow.AddDays(-1),
-        ExpenseType = "Need",
-        PaymentMethod = "UPI",
-        SpendingType = "Monthly"
+        NeedOrWant = NeedOrWant.Need,
+        PaymentMethodId = Guid.NewGuid(),
+        SpendingTypeId = Guid.NewGuid()
+    };
+
+    private static UpdateExpenseRequest ValidUpdate() => new()
+    {
+        CategoryId = Guid.NewGuid(),
+        Amount = 10m,
+        ExpenseDate = DateTime.UtcNow.AddDays(-1),
+        NeedOrWant = NeedOrWant.Want,
+        PaymentMethodId = Guid.NewGuid(),
+        SpendingTypeId = Guid.NewGuid()
     };
 
     [Fact]
     public Task Create_NullRequest_Throws()
         => Assert.ThrowsAsync<ArgumentNullException>(() => _service.CreateAsync(null!));
-
-    [Fact]
-    public Task Create_InvalidFamily_Rejected()
-    {
-        var request = ValidCreate();
-        request.FamilyId = 0;
-        return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
-    }
-
-    [Fact]
-    public Task Create_InvalidMember_Rejected()
-    {
-        var request = ValidCreate();
-        request.FamilyMemberId = 0;
-        return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
-    }
 
     [Fact]
     public Task Create_EmptyCategory_Rejected()
@@ -63,19 +56,45 @@ public class ExpenseServiceValidationTests
         return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
     }
 
-    [Theory]
-    [InlineData("ExpenseType")]
-    [InlineData("PaymentMethod")]
-    [InlineData("SpendingType")]
-    public Task Create_BlankTextField_Rejected(string field)
+    /// <summary>
+    /// Regression for Docs/GAP_ANALYSIS.md H7: at 00:30 IST the UTC clock still
+    /// reads yesterday, so a "today" expense must not be rejected as future-dated.
+    /// </summary>
+    [Fact]
+    public async Task Create_TodayInIndianTime_IsNotTreatedAsFutureDated()
     {
         var request = ValidCreate();
-        switch (field)
-        {
-            case "ExpenseType": request.ExpenseType = " "; break;
-            case "PaymentMethod": request.PaymentMethod = ""; break;
-            default: request.SpendingType = " "; break;
-        }
+        request.ExpenseDate = DateTime.UtcNow.AddHours(5.5).Date;
+
+        // It still fails - there is no database behind this service - but it
+        // must fail on the connection, never on the date.
+        var ex = await Record.ExceptionAsync(() => _service.CreateAsync(request));
+
+        Assert.NotNull(ex);
+        Assert.DoesNotContain("future", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public Task Create_MissingPaymentMethod_Rejected()
+    {
+        var request = ValidCreate();
+        request.PaymentMethodId = Guid.Empty;
+        return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
+    }
+
+    [Fact]
+    public Task Create_MissingSpendingType_Rejected()
+    {
+        var request = ValidCreate();
+        request.SpendingTypeId = Guid.Empty;
+        return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
+    }
+
+    [Fact]
+    public Task Create_InvalidNeedOrWant_Rejected()
+    {
+        var request = ValidCreate();
+        request.NeedOrWant = (NeedOrWant)9;
         return Assert.ThrowsAsync<ArgumentException>(() => _service.CreateAsync(request));
     }
 
@@ -90,19 +109,24 @@ public class ExpenseServiceValidationTests
 
     [Fact]
     public async Task Update_InvalidId_ReturnsFalseWithoutDatabase()
-    {
-        var update = new UpdateExpenseRequest
-        {
-            FamilyId = 1,
-            FamilyMemberId = 1,
-            CategoryId = Guid.NewGuid(),
-            Amount = 10m,
-            ExpenseDate = DateTime.UtcNow.AddDays(-1),
-            ExpenseType = "Need",
-            PaymentMethod = "UPI",
-            SpendingType = "Monthly"
-        };
+        => Assert.False(await _service.UpdateAsync(0, ValidUpdate()));
 
-        Assert.False(await _service.UpdateAsync(0, update));
+    [Fact]
+    public async Task AnonymousCaller_CannotReadAnything()
+    {
+        var service = new ExpenseService(new ThrowingConnectionFactory(), FakeCurrentUser.Anonymous());
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => service.GetAllAsync());
+    }
+
+    [Fact]
+    public async Task CallerWithoutRecordPermission_CannotWrite()
+    {
+        // A Viewer holds no expense.record.own permission.
+        var viewer = new FakeCurrentUser(1, 1, "Viewer", []);
+        var service = new ExpenseService(new ThrowingConnectionFactory(), viewer);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(
+            () => service.CreateAsync(ValidCreate()));
     }
 }

@@ -6,7 +6,7 @@ namespace GharMitra.Tests.Services;
 
 public class CategoryServiceValidationTests
 {
-    private readonly CategoryService _service = new(new ThrowingConnectionFactory());
+    private readonly CategoryService _service = new(new ThrowingConnectionFactory(), FakeCurrentUser.Head());
 
     [Theory]
     [InlineData("")]

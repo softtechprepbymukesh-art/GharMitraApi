@@ -77,13 +77,31 @@ HTTP request
 
 Prerequisites: .NET 10 SDK, SQL Server (LocalDB, Express or full) and SSMS.
 
-**Step 1 – create the database (once).** Open [Database/01_Schema.sql](Database/01_Schema.sql) in SSMS and execute it, or run:
+**Step 1 – create the database (once).** Run the numbered scripts in `Database/` **in order** — each is idempotent and non-destructive, so re-running is safe:
 
 ```bash
-sqlcmd -S "(localdb)\MSSQLLocalDB" -i Database/01_Schema.sql
+for f in 01_Schema 02_Lookups 03_Tenancy 04_Auth 05_WireLookups; do sqlcmd -S "(localdb)\MSSQLLocalDB" -b -i "Database/${f}.sql"; done
 ```
 
-The script is idempotent: it only creates what is missing and never drops or alters existing objects. If you already have a `GharMitraDb` created by the old migrations, its tables are identical, so nothing changes.
+| Script | Adds |
+|--------|------|
+| `01_Schema` | Families, FamilyMembers, Categories, Incomes, Expenses |
+| `02_Lookups` | Accounts, PaymentMethods, IncomeSources, Relations, ExpenseTypes, SpendingTypes + seeds |
+| `03_Tenancy` | FamilyId everywhere, foreign keys, date indexes, time zone |
+| `04_Auth` | Users, Roles, Permissions, RolePermissions, RefreshTokens + seeds |
+| `05_WireLookups` | Lookup FKs on Expenses, Need/Want, 26 system categories |
+
+One exception to "non-destructive": `05_WireLookups` drops `Expenses.PaymentMethod`,
+`ExpenseType` and `SpendingType` *after* backfilling them into foreign keys. Back up first
+if that table holds anything you care about.
+
+**Step 1b – set the JWT signing key.** The API refuses to start without one:
+
+```bash
+dotnet user-secrets set "Jwt:SigningKey" "<at least 32 characters>" --project GharMitra.Api
+```
+
+A development key is already in `appsettings.Development.json`. Never use it outside local development.
 
 **Step 2 – set the connection string** in `GharMitra.Api/appsettings.json` (or override with the environment variable `ConnectionStrings__DefaultConnection`):
 
@@ -184,6 +202,9 @@ Add tests for each new module alongside its service.
 ```
 GharMitra/
 ├── Database/                    SQL scripts
+├── Docs/FUNCTIONAL_FLOW.md      End-to-end functional flow (read this first)
+├── Docs/GAP_ANALYSIS.md         Architecture & business gap analysis
+├── Database/                    01_Schema .. 05_WireLookups (run in order)
 ├── GharMitra.Api/               Web API host
 ├── GharMitra.Application/       Interfaces and DTOs
 ├── GharMitra.Domain/            Entities and rules

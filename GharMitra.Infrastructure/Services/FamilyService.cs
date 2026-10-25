@@ -1,4 +1,5 @@
 using System.Data;
+using GharMitra.Application.Common;
 using GharMitra.Application.Families.DTOs;
 using GharMitra.Application.Families.Interfaces;
 using GharMitra.Infrastructure.Data;
@@ -17,112 +18,92 @@ public sealed class FamilyService : IFamilyService
     private const string MemberOrderBySql = "ORDER BY IsFamilyHead DESC, Name";
 
     private readonly ISqlConnectionFactory _connectionFactory;
+    private readonly ICurrentUser _currentUser;
 
-    public FamilyService(ISqlConnectionFactory connectionFactory)
+    public FamilyService(ISqlConnectionFactory connectionFactory, ICurrentUser currentUser)
     {
         _connectionFactory = connectionFactory
             ?? throw new ArgumentNullException(nameof(connectionFactory));
+        _currentUser = currentUser
+            ?? throw new ArgumentNullException(nameof(currentUser));
     }
 
+    private int FamilyId
+    {
+        get
+        {
+            if (!_currentUser.IsAuthenticated)
+                throw new UnauthorizedAccessException("Authentication is required.");
+
+            return _currentUser.FamilyId;
+        }
+    }
+
+    /// <summary>
+    /// Returns only the caller's own family. There is deliberately no way to
+    /// list every family: that would be a cross-tenant read.
+    /// </summary>
     public async Task<IReadOnlyList<FamilyDto>> GetAllAsync(
         CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        var family = await GetByIdAsync(FamilyId, cancellationToken);
 
-        var families = new List<(int Id, string Name, bool IsActive, DateTime CreatedAt)>();
-        await using (var command = connection.CreateCommand($"{FamilySelectSql} ORDER BY Name"))
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
-        {
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                families.Add((
-                    reader.GetInt32(0),
-                    reader.GetString(1),
-                    reader.GetBoolean(2),
-                    reader.GetDateTime(3)));
-            }
-        }
-
-        IReadOnlyList<FamilyMemberDto> members;
-        await using (var command = connection.CreateCommand($"{MemberSelectSql} {MemberOrderBySql}"))
-        {
-            members = await ReadMembersAsync(command, cancellationToken);
-        }
-
-        return families
-            .Select(f => new FamilyDto(
-                f.Id,
-                f.Name,
-                f.IsActive,
-                f.CreatedAt,
-                members.Where(m => m.FamilyId == f.Id).ToList()))
-            .ToList();
+        return family is null ? Array.Empty<FamilyDto>() : [family];
     }
 
     public async Task<FamilyDto?> GetByIdAsync(
         int id,
         CancellationToken cancellationToken = default)
     {
-        if (id <= 0)
+        // Any id other than the caller's own family is simply not found.
+        if (id <= 0 || id != FamilyId)
             return null;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        return await GetByIdAsync(connection, id, cancellationToken);
+        return await LoadFamilyAsync(connection, id, cancellationToken);
     }
 
-    public async Task<FamilyDto> CreateAsync(
+    /// <summary>
+    /// Families are created by registration (Stage 0), which also creates the
+    /// Family Head login. Creating a bare family through this API would produce
+    /// a tenant nobody can sign in to.
+    /// </summary>
+    public Task<FamilyDto> CreateAsync(
         CreateFamilyRequest request,
         CancellationToken cancellationToken = default)
-    {
-        var name = ValidateName(request.Name);
-        var createdAt = DateTime.UtcNow;
-
-        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var command = connection.CreateCommand(
-            """
-            INSERT INTO Families (Name, IsActive, CreatedAt)
-            OUTPUT INSERTED.Id
-            VALUES (@Name, 1, @CreatedAt)
-            """)
-            .With("@Name", SqlDbType.NVarChar, name, 150)
-            .With("@CreatedAt", SqlDbType.DateTime2, createdAt);
-
-        var id = (int)(await command.ExecuteScalarAsync(cancellationToken))!;
-
-        return new FamilyDto(id, name, true, createdAt, new List<FamilyMemberDto>());
-    }
+        => throw new InvalidOperationException(
+            "Use POST /api/v1/auth/register to create a family together with its Family Head.");
 
     public async Task<bool> UpdateAsync(
         int id,
         UpdateFamilyRequest request,
         CancellationToken cancellationToken = default)
     {
-        if (id <= 0)
-            return false;
+        RequireManagePermission();
 
-        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-
-        if (!await FamilyExistsAsync(connection, id, cancellationToken))
+        if (id <= 0 || id != FamilyId)
             return false;
 
         var name = ValidateName(request.Name);
 
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand(
             "UPDATE Families SET Name = @Name, IsActive = @IsActive WHERE Id = @Id")
             .With("@Id", SqlDbType.Int, id)
             .With("@Name", SqlDbType.NVarChar, name, 150)
             .With("@IsActive", SqlDbType.Bit, request.IsActive);
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
-        return true;
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
     public async Task<bool> DeleteAsync(
         int id,
         CancellationToken cancellationToken = default)
     {
-        if (id <= 0)
+        RequireManagePermission();
+
+        if (id <= 0 || id != FamilyId)
             return false;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
@@ -154,7 +135,7 @@ public sealed class FamilyService : IFamilyService
         int familyId,
         CancellationToken cancellationToken = default)
     {
-        if (familyId <= 0)
+        if (familyId <= 0 || familyId != FamilyId)
             return Array.Empty<FamilyMemberDto>();
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
@@ -170,6 +151,11 @@ public sealed class FamilyService : IFamilyService
         CreateFamilyMemberRequest request,
         CancellationToken cancellationToken = default)
     {
+        RequireManagePermission();
+
+        if (familyId != FamilyId)
+            throw new UnauthorizedAccessException("You can only add members to your own family.");
+
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
         await EnsureActiveFamilyAsync(connection, familyId, cancellationToken);
@@ -219,7 +205,9 @@ public sealed class FamilyService : IFamilyService
         UpdateFamilyMemberRequest request,
         CancellationToken cancellationToken = default)
     {
-        if (familyId <= 0 || memberId <= 0)
+        RequireManagePermission();
+
+        if (familyId <= 0 || memberId <= 0 || familyId != FamilyId)
             return false;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
@@ -271,7 +259,9 @@ public sealed class FamilyService : IFamilyService
         int memberId,
         CancellationToken cancellationToken = default)
     {
-        if (familyId <= 0 || memberId <= 0)
+        RequireManagePermission();
+
+        if (familyId <= 0 || memberId <= 0 || familyId != FamilyId)
             return false;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
@@ -283,7 +273,16 @@ public sealed class FamilyService : IFamilyService
         return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
-    private static async Task<FamilyDto?> GetByIdAsync(
+    private void RequireManagePermission()
+    {
+        if (!_currentUser.IsAuthenticated)
+            throw new UnauthorizedAccessException("Authentication is required.");
+
+        if (!_currentUser.Has(Permission.FamilyManage))
+            throw new UnauthorizedAccessException("Only the Family Head can manage the family.");
+    }
+
+    private static async Task<FamilyDto?> LoadFamilyAsync(
         SqlConnection connection,
         int id,
         CancellationToken cancellationToken)
@@ -315,26 +314,11 @@ public sealed class FamilyService : IFamilyService
         return family with { Members = await ReadMembersAsync(membersCommand, cancellationToken) };
     }
 
-    private static async Task<bool> FamilyExistsAsync(
-        SqlConnection connection,
-        int id,
-        CancellationToken cancellationToken)
-    {
-        await using var command = connection
-            .CreateCommand("SELECT 1 FROM Families WHERE Id = @Id")
-            .With("@Id", SqlDbType.Int, id);
-
-        return await command.ExecuteScalarAsync(cancellationToken) is not null;
-    }
-
     private static async Task EnsureActiveFamilyAsync(
         SqlConnection connection,
         int familyId,
         CancellationToken cancellationToken)
     {
-        if (familyId <= 0)
-            throw new ArgumentException("Family ID is required.");
-
         await using var command = connection
             .CreateCommand("SELECT IsActive FROM Families WHERE Id = @Id")
             .With("@Id", SqlDbType.Int, familyId);

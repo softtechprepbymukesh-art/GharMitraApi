@@ -4,6 +4,7 @@ namespace GharMitra.Api.Controllers;
 
 [ApiController]
 [Route("api/v1/[controller]")]
+[Microsoft.AspNetCore.Authorization.AllowAnonymous]
 public class HealthController : ControllerBase
 {
     [HttpGet]

@@ -5,7 +5,7 @@ namespace GharMitra.Tests.Services;
 
 public class IncomeServiceValidationTests
 {
-    private readonly IncomeService _service = new(new ThrowingConnectionFactory());
+    private readonly IncomeService _service = new(new ThrowingConnectionFactory(), FakeCurrentUser.Head());
     private static readonly Guid CategoryId = Guid.NewGuid();
     private static DateTime Past => DateTime.UtcNow.AddDays(-1);
 
