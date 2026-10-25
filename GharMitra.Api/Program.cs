@@ -115,6 +115,7 @@ builder.Services.AddScoped<ICategoryService, CategoryService>();
 builder.Services.AddScoped<IFamilyService, FamilyService>();
 builder.Services.AddScoped<IIncomeService, IncomeService>();
 builder.Services.AddScoped<IExpenseService, ExpenseService>();
+builder.Services.AddScoped<GharMitra.Application.Planning.Interfaces.IDashboardService, DashboardService>();
 
 // ---- CORS -----------------------------------------------------------------
 // An explicit allow-list. AllowAnyOrigin cannot be combined with credentials
