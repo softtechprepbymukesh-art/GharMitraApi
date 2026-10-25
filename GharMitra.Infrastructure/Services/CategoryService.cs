@@ -1,6 +1,7 @@
 using System.Data;
 using GharMitra.Application.Categories.DTOs;
 using GharMitra.Application.Categories.Interfaces;
+using GharMitra.Application.Common;
 using GharMitra.Domain.Entities;
 using GharMitra.Infrastructure.Data;
 using Microsoft.Data.SqlClient;
@@ -12,19 +13,41 @@ public sealed class CategoryService : ICategoryService
     private const string SelectColumns =
         "Id, Name, Description, Type, IsActive, DisplayOrder, CreatedAt, UpdatedAt";
 
-    private readonly ISqlConnectionFactory _connectionFactory;
+    /// <summary>
+    /// A family sees the shared system defaults (FamilyId IS NULL) plus the
+    /// categories it created itself. It can never see another family's.
+    /// </summary>
+    private const string VisibilitySql = "(FamilyId IS NULL OR FamilyId = @FamilyId)";
 
-    public CategoryService(ISqlConnectionFactory connectionFactory)
+    private readonly ISqlConnectionFactory _connectionFactory;
+    private readonly ICurrentUser _currentUser;
+
+    public CategoryService(ISqlConnectionFactory connectionFactory, ICurrentUser currentUser)
     {
         _connectionFactory = connectionFactory;
+        _currentUser = currentUser;
+    }
+
+    private int FamilyId
+    {
+        get
+        {
+            if (!_currentUser.IsAuthenticated)
+                throw new UnauthorizedAccessException("Authentication is required.");
+
+            return _currentUser.FamilyId;
+        }
     }
 
     public async Task<IReadOnlyList<CategoryDto>> GetAllAsync(
         CancellationToken cancellationToken = default)
     {
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var command = connection.CreateCommand(
-            $"SELECT {SelectColumns} FROM Categories ORDER BY Type, DisplayOrder, Name");
+        await using var command = connection
+            .CreateCommand(
+                $"SELECT {SelectColumns} FROM Categories WHERE {VisibilitySql} " +
+                "ORDER BY Type, DisplayOrder, Name")
+            .With("@FamilyId", SqlDbType.Int, FamilyId);
 
         return await ReadAllAsync(command, cancellationToken);
     }
@@ -35,8 +58,9 @@ public sealed class CategoryService : ICategoryService
     {
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var command = connection
-            .CreateCommand($"SELECT {SelectColumns} FROM Categories WHERE Id = @Id")
-            .With("@Id", SqlDbType.UniqueIdentifier, id);
+            .CreateCommand($"SELECT {SelectColumns} FROM Categories WHERE Id = @Id AND {VisibilitySql}")
+            .With("@Id", SqlDbType.UniqueIdentifier, id)
+            .With("@FamilyId", SqlDbType.Int, FamilyId);
 
         var items = await ReadAllAsync(command, cancellationToken);
         return items.Count == 0 ? null : items[0];
@@ -46,6 +70,9 @@ public sealed class CategoryService : ICategoryService
         CreateCategoryRequest request,
         CancellationToken cancellationToken = default)
     {
+        RequireManagePermission();
+
+        var familyId = FamilyId;
         var name = request.Name.Trim();
 
         if (string.IsNullOrWhiteSpace(name))
@@ -57,7 +84,7 @@ public sealed class CategoryService : ICategoryService
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (await NameExistsAsync(connection, name, request.Type, null, cancellationToken))
+        if (await NameExistsAsync(connection, familyId, name, request.Type, null, cancellationToken))
         {
             throw new InvalidOperationException(
                 $"Category '{name}' already exists for {request.Type}.");
@@ -72,9 +99,11 @@ public sealed class CategoryService : ICategoryService
         await using var command = connection.CreateCommand(
             """
             INSERT INTO Categories
-                (Id, Name, Description, Type, IsActive, DisplayOrder, CreatedAt, UpdatedAt)
+                (Id, Name, Description, Type, IsActive, DisplayOrder, FamilyId, IsSystem,
+                 CreatedAt, UpdatedAt)
             VALUES
-                (@Id, @Name, @Description, @Type, @IsActive, @DisplayOrder, @CreatedAt, NULL)
+                (@Id, @Name, @Description, @Type, @IsActive, @DisplayOrder, @FamilyId, 0,
+                 @CreatedAt, NULL)
             """)
             .With("@Id", SqlDbType.UniqueIdentifier, category.Id)
             .With("@Name", SqlDbType.NVarChar, category.Name, 100)
@@ -82,6 +111,7 @@ public sealed class CategoryService : ICategoryService
             .With("@Type", SqlDbType.Int, (int)category.Type)
             .With("@IsActive", SqlDbType.Bit, category.IsActive)
             .With("@DisplayOrder", SqlDbType.Int, category.DisplayOrder)
+            .With("@FamilyId", SqlDbType.Int, familyId)
             .With("@CreatedAt", SqlDbType.DateTime2, category.CreatedAt);
 
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -102,12 +132,16 @@ public sealed class CategoryService : ICategoryService
         UpdateCategoryRequest request,
         CancellationToken cancellationToken = default)
     {
+        RequireManagePermission();
+
+        var familyId = FamilyId;
+
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        if (!await ExistsAsync(connection, id, cancellationToken))
-        {
+        // Only the family's own categories are editable. A system default is
+        // shared by every family and must not be changed by one of them.
+        if (!await OwnCategoryExistsAsync(connection, familyId, id, cancellationToken))
             return false;
-        }
 
         var name = request.Name.Trim();
 
@@ -118,7 +152,7 @@ public sealed class CategoryService : ICategoryService
                 nameof(request.Name));
         }
 
-        if (await NameExistsAsync(connection, name, request.Type, id, cancellationToken))
+        if (await NameExistsAsync(connection, familyId, name, request.Type, id, cancellationToken))
         {
             throw new InvalidOperationException(
                 $"Category '{name}' already exists for {request.Type}.");
@@ -132,49 +166,64 @@ public sealed class CategoryService : ICategoryService
                 Type = @Type,
                 DisplayOrder = @DisplayOrder,
                 UpdatedAt = @UpdatedAt
-            WHERE Id = @Id
+            WHERE Id = @Id AND FamilyId = @FamilyId
             """)
             .With("@Id", SqlDbType.UniqueIdentifier, id)
+            .With("@FamilyId", SqlDbType.Int, familyId)
             .With("@Name", SqlDbType.NVarChar, name, 100)
             .With("@Description", SqlDbType.NVarChar, request.Description?.Trim(), 500)
             .With("@Type", SqlDbType.Int, (int)request.Type)
             .With("@DisplayOrder", SqlDbType.Int, request.DisplayOrder)
             .With("@UpdatedAt", SqlDbType.DateTime2, DateTime.UtcNow);
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
-
-        return true;
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
     public async Task<bool> DeleteAsync(
         Guid id,
         CancellationToken cancellationToken = default)
     {
+        RequireManagePermission();
+
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
         // Soft delete: category database se physically delete nahi hogi.
         await using var command = connection.CreateCommand(
-            "UPDATE Categories SET IsActive = 0, UpdatedAt = @UpdatedAt WHERE Id = @Id")
+            "UPDATE Categories SET IsActive = 0, UpdatedAt = @UpdatedAt " +
+            "WHERE Id = @Id AND FamilyId = @FamilyId")
             .With("@Id", SqlDbType.UniqueIdentifier, id)
+            .With("@FamilyId", SqlDbType.Int, FamilyId)
             .With("@UpdatedAt", SqlDbType.DateTime2, DateTime.UtcNow);
 
         return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
-    private static async Task<bool> ExistsAsync(
+    private void RequireManagePermission()
+    {
+        if (!_currentUser.IsAuthenticated)
+            throw new UnauthorizedAccessException("Authentication is required.");
+
+        if (!_currentUser.Has(Permission.CategoryManage))
+            throw new UnauthorizedAccessException("You are not allowed to manage categories.");
+    }
+
+    private static async Task<bool> OwnCategoryExistsAsync(
         SqlConnection connection,
+        int familyId,
         Guid id,
         CancellationToken cancellationToken)
     {
         await using var command = connection
-            .CreateCommand("SELECT 1 FROM Categories WHERE Id = @Id")
-            .With("@Id", SqlDbType.UniqueIdentifier, id);
+            .CreateCommand("SELECT 1 FROM Categories WHERE Id = @Id AND FamilyId = @FamilyId")
+            .With("@Id", SqlDbType.UniqueIdentifier, id)
+            .With("@FamilyId", SqlDbType.Int, familyId);
 
         return await command.ExecuteScalarAsync(cancellationToken) is not null;
     }
 
     private static async Task<bool> NameExistsAsync(
         SqlConnection connection,
+        int familyId,
         string name,
         CategoryType type,
         Guid? excludeId,
@@ -183,10 +232,13 @@ public sealed class CategoryService : ICategoryService
         await using var command = connection.CreateCommand(
             """
             SELECT 1 FROM Categories
-            WHERE Name = @Name AND Type = @Type AND (@ExcludeId IS NULL OR Id <> @ExcludeId)
+            WHERE Name = @Name AND Type = @Type
+              AND (FamilyId IS NULL OR FamilyId = @FamilyId)
+              AND (@ExcludeId IS NULL OR Id <> @ExcludeId)
             """)
             .With("@Name", SqlDbType.NVarChar, name, 100)
             .With("@Type", SqlDbType.Int, (int)type)
+            .With("@FamilyId", SqlDbType.Int, familyId)
             .With("@ExcludeId", SqlDbType.UniqueIdentifier, excludeId);
 
         return await command.ExecuteScalarAsync(cancellationToken) is not null;

@@ -217,8 +217,7 @@ public class ExpenseController : ControllerBase
         try
         {
             _logger.LogInformation(
-                "Creating new expense for FamilyId: {FamilyId}, Amount: {Amount}",
-                request.FamilyId,
+                "Creating new expense, Amount: {Amount}",
                 request.Amount);
 
             var expense = await _expenseService.CreateAsync(

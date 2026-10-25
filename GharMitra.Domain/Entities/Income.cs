@@ -26,7 +26,7 @@ public class Income
             throw new ArgumentException("Source name is required.", nameof(sourceName));
         if (amount <= 0)
             throw new ArgumentException("Amount must be greater than zero.", nameof(amount));
-        if (incomeDate > DateTime.UtcNow)
+        if (incomeDate.Date > DateTime.UtcNow.AddHours(14).Date)
             throw new ArgumentException("Income date cannot be in the future.", nameof(incomeDate));
         if (categoryId == Guid.Empty)
             throw new ArgumentException("Category ID is required.", nameof(categoryId));
@@ -50,7 +50,7 @@ public class Income
             throw new ArgumentException("Source name is required.", nameof(sourceName));
         if (amount <= 0)
             throw new ArgumentException("Amount must be greater than zero.", nameof(amount));
-        if (incomeDate > DateTime.UtcNow)
+        if (incomeDate.Date > DateTime.UtcNow.AddHours(14).Date)
             throw new ArgumentException("Income date cannot be in the future.", nameof(incomeDate));
         if (categoryId == Guid.Empty)
             throw new ArgumentException("Category ID is required.", nameof(categoryId));
